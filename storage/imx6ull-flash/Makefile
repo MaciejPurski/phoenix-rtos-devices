@@ -4,7 +4,7 @@
 # Copyright 2018, 2019 Phoenix Systems
 #
 
-$(PREFIX_PROG)imx6ull-flash: $(addprefix $(PREFIX_O)storage/imx6ull-flash/, flashdrv.o flashsrv.o) $(PREFIX_A)libjffs2.a
+$(PREFIX_PROG)imx6ull-flash: $(addprefix $(PREFIX_O)storage/imx6ull-flash/, flashdrv.o flashsrv.o qspi.o flashnor.o) $(PREFIX_A)libjffs2.a
 	$(LINK)
 
 $(PREFIX_A)libflashdrv.a: $(PREFIX_O)storage/imx6ull-flash/flashdrv.o

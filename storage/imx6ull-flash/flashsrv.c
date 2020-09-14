@@ -15,6 +15,7 @@
 #include "posix/idtree.h"
 #include "flashsrv.h"
 #include "flashdrv.h"
+#include "flashnor.h"
 
 #include "../../../phoenix-rtos-filesystems/jffs2/libjffs2.h"
 
@@ -681,6 +682,11 @@ int main(int argc, char **argv)
 	unsigned port;
 	char path[32];
 
+	printf("Initializing NOR\n");
+	flashnor_init();
+	printf("NOR initialized\n");
+
+	return 0;
 	portCreate(&port);
 
 	TRACE("got port %d", port);
