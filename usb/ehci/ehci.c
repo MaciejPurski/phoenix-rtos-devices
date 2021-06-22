@@ -122,7 +122,7 @@ static struct qtd *ehci_allocQtd(int token, size_t maxpacksz, char *buffer, size
 {
 	FUN_TRACE;
 	struct qtd *qtd = NULL;
-	size_t bytes;
+	size_t bytes = 0;
 	int i, offs;
 
 	if ((qtd = ehci_alloc()) == NULL)
@@ -148,7 +148,7 @@ static struct qtd *ehci_allocQtd(int token, size_t maxpacksz, char *buffer, size
 			offs = min(*size - bytes, EHCI_PAGE_SIZE);
 			/* If the data does not fit one qtd, don't leave a trailing short packet */
 			if (i == 4 && bytes + offs < *size)
-				offs = ((bytes + offs) & ~(maxpacksz - 1)) - bytes;
+				offs = (((bytes + offs) / maxpacksz) * maxpacksz) - bytes;
 
 			bytes += offs;
 			buffer += offs;
@@ -302,17 +302,14 @@ static void ehci_linkQh(hcd_t *hcd, struct qh_node *node)
 }
 
 
-static void ehci_qtdsFree(struct qtd_node *qtds)
+static void ehci_qtdsFree(struct qtd_node **head)
 {
-	struct qtd_node *e, *n;
+	struct qtd_node *q;
 
-	if ((e = qtds) != NULL) {
-		do {
-			n = e->next;
-			ehci_freeQtd(e->qtd);
-			free(e);
-		}
-		while ((e = n) != qtds);
+	while ((q = *head) != NULL) {
+		LIST_REMOVE(head, q);
+		ehci_freeQtd(q->qtd);
+		free(q);
 	}
 }
 
@@ -389,6 +386,7 @@ static int ehci_transferStatus(hcd_t *hcd, usb_transfer_t *t)
 
 	t->finished = finished;
 	t->error = error;
+	t->transfered = t->size - qtds->prev->qtd->bytes_to_transfer;
 
 	return finished;
 }
@@ -398,9 +396,10 @@ static void ehci_irqThread(void *arg)
 {
 	hcd_t *hcd = (hcd_t *)arg;
 	ehci_t *ehci = (ehci_t *)hcd->priv;
-	usb_transfer_t *t, *p;
+	usb_transfer_t *t, *n, *head;
 	struct qh_node *qh_node;
 	struct qtd_node *qtd_node;
+	int cont;
 	int res;
 
 	mutexLock(ehci->irq_lock);
@@ -411,18 +410,19 @@ static void ehci_irqThread(void *arg)
 			do {
 				qh_node = (struct qh_node *)t->endpoint->hcdpriv;
 				qtd_node = (struct qtd_node *)t->hcdpriv;
-
-				if (ehci_transferStatus(hcd, t)) {
+				cont = 0;
+				n = t->next;
+				if (ehci_transferStatus(hcd, t) != 0) {
 					/* Transfer finished */
 					ehci_continue(qh_node, qtd_node->prev->qtd);
-					p = t->prev;
 					LIST_REMOVE(&hcd->transfers, t);
-					ehci_qtdsFree(qtd_node);
+					ehci_qtdsFree(&qtd_node);
 					t->hcdpriv = NULL;
 					usb_transferFinished(t);
-					t = p;
+					if (n != t)
+						cont = 1;
 				}
-			} while (hcd->transfers && (t = t->next) != hcd->transfers);
+			} while (hcd->transfers && ((t = n) != hcd->transfers || cont));
 		}
 		mutexUnlock(hcd->transLock);
 	}
@@ -507,7 +507,7 @@ static int ehci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t)
 	/* Setup stage */
 	if (t->type == usb_transfer_control) {
 		if (ehci_addQtd(&qtds, setup_token, ep->max_packet_len, (char *)t->setup, sizeof(usb_setup_packet_t), 0) < 0) {
-			ehci_qtdsFree(qtds);
+			ehci_qtdsFree(&qtds);
 			t->hcdpriv = NULL;
 			return -ENOMEM;
 		}
@@ -516,7 +516,7 @@ static int ehci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t)
 	/* Data stage */
 	if ((t->type == usb_transfer_control && t->size > 0) || t->type == usb_transfer_bulk) {
 		if (ehci_addQtd(&qtds, token, ep->max_packet_len, t->buffer, t->size, 1) < 0) {
-			ehci_qtdsFree(qtds);
+			ehci_qtdsFree(&qtds);
 			t->hcdpriv = NULL;
 			return -ENOMEM;
 		}
@@ -526,7 +526,7 @@ static int ehci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t)
 	if (t->type == usb_transfer_control) {
 		token = (token == in_token) ? out_token : in_token;
 		if (ehci_addQtd(&qtds, token, ep->max_packet_len, NULL, 0, 1) < 0) {
-			ehci_qtdsFree(qtds);
+			ehci_qtdsFree(&qtds);
 			t->hcdpriv = NULL;
 			return -ENOMEM;
 		}
@@ -552,6 +552,7 @@ static int ehci_transferEnqueue(hcd_t *hcd, usb_transfer_t *t)
 	return 0;
 }
 
+
 static void ehci_epDestroy(hcd_t *hcd, usb_endpoint_t *ep)
 {
 	ehci_t *ehci = (ehci_t *)hcd->priv;
@@ -574,7 +575,7 @@ static void ehci_devDestroy(hcd_t *hcd, usb_device_t *dev)
 {
 	ehci_t *ehci = (ehci_t *)hcd->priv;
 	struct qh_node *qh;
-	usb_transfer_t *t, *p;
+	usb_transfer_t *t, *n;
 	usb_endpoint_t *ep;
 	int i, j;
 
@@ -600,13 +601,16 @@ static void ehci_devDestroy(hcd_t *hcd, usb_device_t *dev)
 		mutexLock(hcd->transLock);
 		do {
 			if (t->endpoint->device == dev) {
-				p = t->prev;
+				n = t->next;
 				LIST_REMOVE(&hcd->transfers, t);
 				ehci_transferStatus(hcd, t);
-				usb_transferFinished(t);
-				t = p;
-				ehci_qtdsFree(t->hcdpriv);
+				ehci_qtdsFree((struct qtd_node **)&t->hcdpriv);
 				t->hcdpriv = NULL;
+				usb_transferFinished(t);
+				if (hcd->transfers != NULL && n != hcd->transfers) {
+					t = n;
+					continue;
+				}
 			}
 
 		} while (hcd->transfers && (t = t->next) != hcd->transfers);

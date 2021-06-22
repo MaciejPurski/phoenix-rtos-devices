@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <sys/list.h>
 #include <sys/msg.h>
+#include <sys/minmax.h>
 #include <sys/types.h>
 #include <sys/file.h>
 #include <sys/threads.h>
@@ -48,9 +49,6 @@
 #define CBW_SIG 0x43425355
 #define CSW_SIG 0x53425355
 
-#define MAX_SECS          32
-#define MAX_USB_RETRIES   2
-#define MAX_SCSI_RETRIES  4
 
 typedef struct umass_cbw {
 	uint32_t sig;
@@ -83,7 +81,7 @@ typedef struct scsi_cdb10 {
 
 
 typedef struct umass_dev {
-	char buffer[UMASS_SECTOR_SIZE * 2];
+	char buffer[UMASS_SECTOR_SIZE];
 	char stack[1024] __attribute__ ((aligned(8)));
 	struct umass_dev *prev, *next;
 	usb_insertion_t instance;
@@ -103,6 +101,71 @@ static struct {
 	unsigned drvport;
 } umass_common;
 
+
+typedef struct umass_modeswitch {
+	uint16_t vid;
+	uint16_t pid;
+	uint8_t msg[31];
+	int scsiresp;
+} umass_modeswitch_t;
+
+static umass_modeswitch_t modeswitch[] = {
+	{
+		/* Huawei E3372 ACM mode */
+		.vid = 0x12d1,
+		.pid = 0x1f01,
+		.msg = { 0x55, 0x53, 0x42, 0x43, 0x12, 0x34, 0x56, 0x78, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x06, 0x30, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+		.scsiresp = 1
+	},
+};
+
+
+static umass_modeswitch_t *umass_modeswitchFind(uint16_t vid, uint16_t pid)
+{
+	int i;
+
+	for (i = 0; i < sizeof(modeswitch) / sizeof(umass_modeswitch_t); i++) {
+		if (vid == modeswitch[i].vid && pid == modeswitch[i].pid)
+			return &modeswitch[i];
+	}
+
+	return NULL;
+}
+
+static int umass_modeswitchHandle(umass_dev_t *dev, umass_modeswitch_t *m)
+{
+	umass_csw_t csw = { 0 };
+
+
+	fprintf(stderr, "umass: Performing modeswitch\n");
+	if (usb_transferBulk(dev->pipeOut, m->msg, sizeof(m->msg), usb_dir_out) < 0)
+		return -1;
+	fprintf(stderr, "umass: modeswitch msg write success\n");
+	return 0;
+	if (m->scsiresp) {
+		fprintf(stderr, "umass: Waiting for SCSI RESPONSE\n");
+		if (usb_transferBulk(dev->pipeIn, &csw, sizeof(csw), usb_dir_in) < 0)
+			return -1;
+		fprintf(stderr, "umass: response received\n");
+
+		if (csw.sig != CSW_SIG || csw.tag != ((umass_cbw_t *)m->msg)->tag || csw.status != 0) {
+			fprintf(stderr, "umass: transmit fail\n");
+			return -1;
+		}
+	}
+
+	fprintf(stderr, "umass: modeswitch clearing HALT 1\n");
+	if (usb_clearFeatureHalt(dev->pipeCtrl, 1) != 0)
+		return -1;
+
+	fprintf(stderr, "umass: modeswitch clearing HALT 129\n");
+	if (usb_clearFeatureHalt(dev->pipeCtrl, 129) != 0)
+		return -1;
+	fprintf(stderr, "umass: clear success\n");
+	/* TODO: Clear feature halt */
+
+	return 0;
+}
 
 static void umass_cswDump(umass_csw_t *csw)
 {
@@ -126,15 +189,15 @@ static int umass_transmit(umass_dev_t *dev, void *cmd, size_t clen, char *data, 
 	cbw.clen = clen;
 	memcpy(cbw.cmd, cmd, clen);
 
-	if (usb_transferBulk(dev->pipeOut, &cbw, sizeof(cbw), usb_dir_out) != 0)
+	if (usb_transferBulk(dev->pipeOut, &cbw, sizeof(cbw), usb_dir_out) < 0)
 		return -1;
 
 	if (dlen > 0) {
-		if (usb_transferBulk((dir == usb_dir_in) ? dev->pipeIn : dev->pipeOut, data, dlen, dir) != 0)
+		if (usb_transferBulk((dir == usb_dir_in) ? dev->pipeIn : dev->pipeOut, data, dlen, dir) < 0)
 			return -1;
 	}
 
-	if (usb_transferBulk(dev->pipeIn, &csw, sizeof(csw), usb_dir_in) != 0)
+	if (usb_transferBulk(dev->pipeIn, &csw, sizeof(csw), usb_dir_in) < 0)
 		return -1;
 
 	if (csw.sig != CSW_SIG || csw.tag != cbw.tag || csw.status != 0) {
@@ -158,6 +221,7 @@ static int umass_check(umass_dev_t *dev)
 	if (umass_transmit(dev, testcmd, sizeof(testcmd), NULL, 0, usb_dir_in) < 0)
 		return -1;
 
+	fprintf(stderr, "umass: test success\n");
 	/* Read MBR */
 	if (umass_transmit(dev, &readcmd, sizeof(readcmd), dev->buffer, UMASS_SECTOR_SIZE, usb_dir_in) < 0)
 		return -1;
@@ -168,7 +232,9 @@ static int umass_check(umass_dev_t *dev)
 
 	/* Read only the first partition */
 	dev->partOffset = mbr->pent[0].start;
-	dev->partSize = mbr->pent[0].sectors;
+	/* For now, our OS can only handle disks smaller than 4 GiB */
+	dev->partSize = min(mbr->pent[0].sectors, ((1 << 31) - 1) / 512);
+	fprintf(stderr, "umass: MBR offset: %lu size: %lu\n", dev->partOffset, dev->partSize);
 
 	return 0;
 }
@@ -192,10 +258,11 @@ static int umass_read(umass_dev_t *dev, offs_t offs, char *buf, size_t len)
 {
 	scsi_cdb10_t readcmd = { .opcode = 0x28 };
 
-	if (offs + len > dev->partSize * UMASS_SECTOR_SIZE)
+	fprintf(stderr, "umass: READ offs: %llu len: %llu\n", offs, len);
+	if ((offs % UMASS_SECTOR_SIZE) || (len % UMASS_SECTOR_SIZE))
 		return -EINVAL;
 
-	if ((offs % UMASS_SECTOR_SIZE) || (len % UMASS_SECTOR_SIZE))
+	if (offs + len > dev->partSize * UMASS_SECTOR_SIZE)
 		return -EINVAL;
 
 	readcmd.lba = htonl(offs / UMASS_SECTOR_SIZE + dev->partOffset);
@@ -209,10 +276,11 @@ static int umass_write(umass_dev_t *dev, offs_t offs, char *buf, size_t len)
 {
 	scsi_cdb10_t writecmd = { .opcode = 0x2a };
 
-	if (offs + len > dev->partSize * UMASS_SECTOR_SIZE)
+	fprintf(stderr, "umass: WRITE offs: %llu len: %llu\n", offs, len);
+	if ((offs % UMASS_SECTOR_SIZE) || (len % UMASS_SECTOR_SIZE))
 		return -EINVAL;
 
-	if ((offs % UMASS_SECTOR_SIZE) || (len % UMASS_SECTOR_SIZE))
+	if (offs + len > dev->partSize * UMASS_SECTOR_SIZE)
 		return -EINVAL;
 
 	writecmd.lba = htonl(offs / UMASS_SECTOR_SIZE + dev->partOffset);
@@ -237,7 +305,7 @@ static int umass_getattr(umass_dev_t *dev, int type, int *attr)
 }
 
 
-static void umass_poolthr(void *arg)
+static void umass_msgthr(void *arg)
 {
 	umass_dev_t *dev = (umass_dev_t *)arg;
 	unsigned long rid;
@@ -279,9 +347,10 @@ static int umass_handleInsertion(usb_insertion_t *insertion)
 {
 	char path[32];
 	umass_dev_t *dev;
+	umass_modeswitch_t *msw;
 	oid_t oid;
 
-	dev = (umass_dev_t *)malloc(sizeof(umass_dev_t));
+	dev = malloc(sizeof(umass_dev_t));
 	dev->instance = *insertion;
 
 	if ((dev->pipeCtrl = usb_open(insertion, usb_transfer_control, usb_dir_bi)) < 0) {
@@ -294,6 +363,7 @@ static int umass_handleInsertion(usb_insertion_t *insertion)
 		return -EINVAL;
 	}
 
+	fprintf(stderr, "umass: setConfiguration success\n");
 	if ((dev->pipeIn = usb_open(insertion, usb_transfer_bulk, usb_dir_in)) < 0) {
 		free(dev);
 		return -EINVAL;
@@ -304,6 +374,13 @@ static int umass_handleInsertion(usb_insertion_t *insertion)
 		return -EINVAL;
 	}
 	dev->tag = 0;
+
+	if ((msw = umass_modeswitchFind(insertion->descriptor.idVendor, insertion->descriptor.idProduct)) != NULL) {
+		fprintf(stderr, "umass: modeswitch found!\n");
+		umass_modeswitchHandle(dev, msw);
+		//free(dev);
+		return 0;
+	}
 
 	if (umass_check(dev)) {
 		free(dev);
@@ -333,7 +410,7 @@ static int umass_handleInsertion(usb_insertion_t *insertion)
 
 	LIST_ADD(&umass_common.devices, dev);
 
-	return beginthread(umass_poolthr, 4, dev->stack, sizeof(dev->stack), dev);
+	return beginthread(umass_msgthr, 4, dev->stack, sizeof(dev->stack), dev);
 }
 
 
